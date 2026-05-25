@@ -26,8 +26,6 @@ Run:
     uv run python paged_attn/01_standard_attention.py
 """
 
-from __future__ import annotations
-
 import math
 import time
 from dataclasses import dataclass
@@ -102,7 +100,7 @@ class MiniSelfAttention(nn.Module):
     # Path B: with cache.  Only projects the NEW tokens; appends to cache.
     # ------------------------------------------------------------------
     def forward_with_cache(self, x_new: torch.Tensor,
-                           cache: ContiguousKVCache) -> torch.Tensor:
+                           cache: "ContiguousKVCache") -> torch.Tensor:
         """Project only `x_new`, append its K/V to `cache`, attend over the
         full (cached + new) K/V history.
 
@@ -110,7 +108,7 @@ class MiniSelfAttention(nn.Module):
         """
         q_new, k_new, v_new = self._project(x_new)  # each [B, H, L_new, hd]
         cache.append(k_new, v_new)
-        k_all, v_all = cache.valid_view()
+        k_all, v_all = cache.view()
         return scaled_dot_product_attention(q_new, k_all, v_all, causal=True)
 
 
@@ -134,7 +132,7 @@ class ContiguousKVCache:
 
     @classmethod
     def empty(cls, batch: int, n_heads: int, max_len: int, head_dim: int,
-              device: torch.device, dtype: torch.dtype) -> ContiguousKVCache:
+              device: torch.device, dtype: torch.dtype) -> "ContiguousKVCache":
         return cls(
             k=torch.zeros(batch, n_heads, max_len, head_dim, device=device, dtype=dtype),
             v=torch.zeros(batch, n_heads, max_len, head_dim, device=device, dtype=dtype),
@@ -143,8 +141,8 @@ class ContiguousKVCache:
 
     def append(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
         """Append `L_new` tokens (same for every batch row) to the cache."""
-        B, H, L_new, D = k_new.shape
         assert k_new.shape == v_new.shape
+        B, H, L_new, D = k_new.shape
         # For clarity this toy assumes the batch is aligned; step 06 lifts that.
         offset = int(self.lengths[0].item())
         assert torch.all(self.lengths == offset), "this toy cache assumes aligned lengths"
@@ -152,7 +150,7 @@ class ContiguousKVCache:
         self.v[:, :, offset:offset + L_new] = v_new
         self.lengths += L_new
 
-    def valid_view(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def view(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the currently-valid prefix of K/V (sliced to current length)."""
         L = int(self.lengths[0].item())
         return self.k[:, :, :L], self.v[:, :, :L]

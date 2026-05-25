@@ -13,8 +13,6 @@ Run:
     uv run python paged_attn/02_kv_cache_fragmentation.py
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import numpy as np
