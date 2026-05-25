@@ -102,7 +102,7 @@ class MiniSelfAttention(nn.Module):
     # Path B: with cache.  Only projects the NEW tokens; appends to cache.
     # ------------------------------------------------------------------
     def forward_with_cache(self, x_new: torch.Tensor,
-                           cache: "ContiguousKVCache") -> torch.Tensor:
+                           cache: ContiguousKVCache) -> torch.Tensor:
         """Project only `x_new`, append its K/V to `cache`, attend over the
         full (cached + new) K/V history.
 
@@ -134,7 +134,7 @@ class ContiguousKVCache:
 
     @classmethod
     def empty(cls, batch: int, n_heads: int, max_len: int, head_dim: int,
-              device: torch.device, dtype: torch.dtype) -> "ContiguousKVCache":
+              device: torch.device, dtype: torch.dtype) -> ContiguousKVCache:
         return cls(
             k=torch.zeros(batch, n_heads, max_len, head_dim, device=device, dtype=dtype),
             v=torch.zeros(batch, n_heads, max_len, head_dim, device=device, dtype=dtype),
