@@ -47,11 +47,13 @@ uv run python paged_attn/06_mini_inference_engine.py
 
 ### 01. 标准 attention + KV cache
 
-- 重新推导 prefill / decode 两阶段。
-- 流式解码（每步 append K/V 然后 attend over full cache）与一次性 attention 的
-  数值等价（误差 \~2e-7）。
-- 给出最简单的"连续 KV cache"实现：`[B, H, max_len, D]`，并算出在我们这个
-  toy 配置里就已经浪费了 75% 的预留空间。
+- 用一个真实的 `MiniSelfAttention(Wq/Wk/Wv)` 层，把 prefill / decode 两阶段写清楚。
+- 同一组 token 跑两条解码路径：
+  - **无 cache**：每步把"prompt + 已生成 token"整段重过 `Wq/Wk/Wv`，全量 attention。
+  - **有 cache**：prefill 一次后，每步只投影那 1 个新 token，老 K/V 从 cache 读。
+- 数值等价（fp32 误差 \~1e-7）+ 成本对比：toy 配置 `d_model=128, prompt=32, decode=64`
+  下 FLOPs **278M → 6M，~46×**；wall time \~3×（toy 尺寸下被 Python 开销稀释）。
+- 顺带量化"连续 KV cache"在 max_len 预留下浪费 75% 的预留空间，引出 step 02。
 
 ### 02. 为什么需要分页：KV cache 浪费量化
 
@@ -118,7 +120,7 @@ uv run python paged_attn/06_mini_inference_engine.py
 
 | 步骤 | dtype | 对照 | 最大绝对误差 |
 | --- | --- | --- | --- |
-| 01 streaming decode vs 一次性 | fp32 | one-shot attention | 2.4e-7 |
+| 01 with-cache vs no-cache (含 Wq/Wk/Wv) | fp32 | no-cache streaming | 1.2e-7 |
 | 04 paged vs contiguous | fp32 | step 01 | 2.4e-7 |
 | 04 prefix-shared child prefix | fp32 | step 01 | 2.4e-7 |
 | 05 Triton vs PyTorch reference | fp16 | step 04 | 9.8e-4 |
