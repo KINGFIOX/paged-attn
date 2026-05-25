@@ -41,7 +41,7 @@ LLAMA2_70B = ModelConfig("Llama-2-70B", n_layers=80, n_kv_heads=8, head_dim=128)
 
 
 def simulate_batch(rng: np.random.Generator, n_seq: int, model: ModelConfig,
-                   short_frac: float = 0.7):
+                   short_frac: float = 0.7) -> np.ndarray:
     """Make a plausible mix of sequence lengths.
 
     Real serving traces are extremely skewed: most chat turns are short, a few
