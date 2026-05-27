@@ -7,6 +7,15 @@ The goal here is *correctness*, not speed:
     * Run attention by gathering K/V from blocks via the block table.
     * Verify the answer matches step 01's contiguous KV cache to ~fp32 noise.
 
+To make the KV-cache story visible, this file reuses step 01's
+`MiniSelfAttention` (real `W_q/W_k/W_v` linear layers).  Both the contiguous
+reference and the paged path run the same prefill + per-step decode loop;
+the *only* difference is where each step's freshly-projected K/V land:
+
+    * Contiguous: into `ContiguousKVCache.k/v[:, :, offset, :]`.
+    * Paged    : into `pool.buffer[phys_block, :, :, slot, :]` via the
+                 block table.
+
 Once we trust this reference, step 05 will port the gather + dot product
 into a fused Triton kernel.
 
@@ -16,12 +25,7 @@ Run:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass
-from typing import Sequence as SeqT
-
 import torch
-import torch.nn.functional as F
 
 # We import by full path because the sibling files start with a digit.
 import importlib.util as _ilu
@@ -42,11 +46,19 @@ _bm = _load("paged_attn._03_block_manager", _HERE / "03_block_manager.py")
 KVPool, BlockManager, Sequence = _bm.KVPool, _bm.BlockManager, _bm.Sequence
 _std = _load("paged_attn._01_standard_attention", _HERE / "01_standard_attention.py")
 scaled_dot_product_attention = _std.scaled_dot_product_attention
+MiniSelfAttention = _std.MiniSelfAttention
+ContiguousKVCache = _std.ContiguousKVCache
 
 
 # ---------------------------------------------------------------------------
-# Writing K/V into the paged pool, one token at a time.
+# Writing K/V into the paged pool.
 # ---------------------------------------------------------------------------
+#
+# The common case "extend the sequence by L tokens with these K/V" lives on
+# `BlockManager.append_kv` (step 03) so the block manager stays a complete
+# KV-cache layer on its own.  We keep `store_kv` here as a lower-level
+# primitive for the rare case where you need to *overwrite* an arbitrary
+# offset that has already been reserved.
 
 
 def store_kv(pool: KVPool, seq: Sequence, k: torch.Tensor, v: torch.Tensor,
@@ -54,8 +66,10 @@ def store_kv(pool: KVPool, seq: Sequence, k: torch.Tensor, v: torch.Tensor,
     """Write `k`,`v` of shape `[n_heads, L, head_dim]` into the pool, starting
     at `token_offset` within `seq`'s virtual address space.
 
-    The sequence must already have enough logical blocks reserved (the
-    BlockManager.append_tokens call handles that).
+    `seq` must already have `token_offset + L` slots reserved via
+    `BlockManager.reserve_slots` or `append_kv`.  Use this when you want to
+    re-write existing slots (e.g. swap-in restore); for the normal append
+    flow call `BlockManager.append_kv` directly.
     """
     n_heads, L, head_dim = k.shape
     bs = pool.block_size
@@ -84,7 +98,6 @@ def gather_kv(pool: KVPool, seq: Sequence) -> tuple[torch.Tensor, torch.Tensor]:
     to a fused kernel.  The real PagedAttention kernel never materializes this;
     it does dot products directly against the block buffer.
     """
-    bs = pool.block_size
     L = seq.length
     H, D = pool.n_heads, pool.head_dim
 
@@ -116,8 +129,16 @@ def paged_attention_single(
 
 
 # ---------------------------------------------------------------------------
-# Demo: prefill + decode, paged side vs contiguous side, exact match.
+# Demo: prefill + decode, paged side vs step 01's contiguous KV cache.
 # ---------------------------------------------------------------------------
+#
+# Both paths share *the same* MiniSelfAttention (so the same W_q/W_k/W_v), and
+# both iterate prefill -> decode_steps decode steps.  Every decode step only
+# projects the single new token — that is the whole point of the KV cache.
+# The only difference between the two paths is where that single new K/V row
+# lands: in `ContiguousKVCache.k/v[:, :, offset]` for the reference, vs in
+# `pool.buffer[phys, :, :, slot]` (via the block table) for the paged path.
+# When everything works the two paths must agree to fp32 noise.
 
 
 def run_demo() -> None:
@@ -125,98 +146,128 @@ def run_demo() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
 
-    H, D = 4, 16
+    B = 1                       # paged path is single-sequence in this file
+    n_heads, d_model = 4, 64
+    head_dim = d_model // n_heads
     block_size = 4
-    prompt_len = 10           # not a multiple of block_size on purpose
+    prompt_len = 10             # deliberately not a multiple of block_size
     decode_steps = 6
     total_len = prompt_len + decode_steps
 
-    # Pool sized to comfortably hold the whole sequence.
-    pool = KVPool(num_blocks=16, n_heads=H, block_size=block_size, head_dim=D,
-                  dtype=dtype, device=device)
+    # Same attention layer as step 01.  W_q/W_k/W_v live here.
+    attn = MiniSelfAttention(d_model, n_heads).to(device=device, dtype=dtype)
+    # Fake "input tokens": in a real transformer these come from the embedding
+    # layer (or the previous block's output).  We materialise the whole stream
+    # up front so that both paths consume the exact same inputs at each step.
+    tokens = torch.randn(B, total_len, d_model, device=device, dtype=dtype)
+
+    # ----------------------------------------------------------------------
+    # Path A — contiguous KV cache.  Same loop as step 01 path B:
+    #          one prefill call, then decode one token at a time, projecting
+    #          only the single new token's Q/K/V on each step.
+    # ----------------------------------------------------------------------
+    cache = ContiguousKVCache.empty(B, n_heads, total_len, head_dim, device, dtype)
+    outs_a: list[torch.Tensor] = []
+
+    # forward_with_cache with _project inside
+    out_p = attn.forward_with_cache(tokens[:, :prompt_len], cache)   # [B,H,Lp,hd]
+    outs_a.append(out_p)
+    for t in range(decode_steps):
+        x_new = tokens[:, prompt_len + t : prompt_len + t + 1]       # [B,1,d]
+        out_t = attn.forward_with_cache(x_new, cache)                # [B,H,1,hd]
+        outs_a.append(out_t)
+    out_contig = torch.cat(outs_a, dim=2).squeeze(0)                 # [H,total,hd]
+
+    # ----------------------------------------------------------------------
+    # Path B — paged KV cache.  Identical loop, but the cache is the paged
+    #          pool indexed by `seq.block_table`.  At every step we project
+    #          *only the new token* via the SAME attn._project(), then push
+    #          the freshly-projected K/V into the pool with `append_kv`.
+    # ----------------------------------------------------------------------
+    pool = KVPool(num_blocks=16, n_heads=n_heads, block_size=block_size,
+                  head_dim=head_dim, dtype=dtype, device=device)
     mgr = BlockManager(pool)
     seq = mgr.new_sequence()
+    outs_b: list[torch.Tensor] = []
 
-    # Fake Q/K/V — generated once so we can compare paged vs contiguous on the
-    # same numbers.
-    full_q = torch.randn(H, total_len, D, device=device, dtype=dtype)
-    full_k = torch.randn(H, total_len, D, device=device, dtype=dtype)
-    full_v = torch.randn(H, total_len, D, device=device, dtype=dtype)
+    # prefill: project the whole prompt in one call (Lq = prompt_len).
+    q_p, k_p, v_p = attn._project(tokens[:, :prompt_len])            # [B,H,Lp,hd]
+    mgr.append_kv(seq, k_p.squeeze(0), v_p.squeeze(0))
+    outs_b.append(paged_attention_single(pool, seq, q_p.squeeze(0), causal=True))
 
-    # ---- (a) Contiguous reference (single sequence) ----
-    ref_out = scaled_dot_product_attention(
-        full_q.unsqueeze(0), full_k.unsqueeze(0), full_v.unsqueeze(0), causal=True
-    ).squeeze(0)  # [H, total_len, D]
+    # decode: one token at a time => one Q/K/V row at a time.
+    for t in range(decode_steps):
+        x_new = tokens[:, prompt_len + t : prompt_len + t + 1]
+        q_n, k_n, v_n = attn._project(x_new)                         # [B,H,1,hd]
+        mgr.append_kv(seq, k_n.squeeze(0), v_n.squeeze(0))
+        outs_b.append(
+            paged_attention_single(pool, seq, q_n.squeeze(0), causal=True)
+        )
 
-    # ---- (b) Paged: prefill ----
-    mgr.append_tokens(seq, prompt_len)
-    store_kv(pool, seq, full_k[:, :prompt_len], full_v[:, :prompt_len], token_offset=0)
-    out_prefill = paged_attention_single(pool, seq, full_q[:, :prompt_len], causal=True)
+    # Every entry in `outs_b` is already [H, *, hd]; just concat along Lq.
+    out_paged = torch.cat(outs_b, dim=1)                             # [H,total,hd]
 
-    chunks = [out_prefill]
-
-    # ---- (c) Paged: decode one token at a time ----
-    for step in range(decode_steps):
-        pos = prompt_len + step
-        mgr.append_tokens(seq, 1)
-        store_kv(pool, seq,
-                 full_k[:, pos:pos + 1], full_v[:, pos:pos + 1],
-                 token_offset=pos)
-        out_t = paged_attention_single(pool, seq, full_q[:, pos:pos + 1], causal=True)
-        chunks.append(out_t)
-
-    paged_out = torch.cat(chunks, dim=1)  # [H, total_len, D]
-
-    err = (ref_out - paged_out).abs().max().item()
-    print(f"[04] max |contiguous - paged| = {err:.2e}  (block_size={block_size})")
+    err = (out_contig - out_paged).abs().max().item()
+    print(
+        f"[04] max |contiguous KV cache - paged KV cache| = {err:.2e}  "
+        f"(prompt_len={prompt_len}, decode_steps={decode_steps}, "
+        f"block_size={block_size})"
+    )
     assert err < 1e-4, "paged attention disagrees with contiguous reference!"
 
-    # ---- (d) Show the block layout: tokens scattered across non-contiguous blocks ----
+    # ---- (c) Show the block layout: tokens scattered across non-contiguous blocks ----
     print(f"[04] sequence length = {seq.length}")
     print(f"[04] logical -> physical block table: {seq.block_table}")
     print(f"[04] pool utilization: "
           f"{mgr.utilization()['blocks_used']}/{pool.num_blocks} blocks "
           f"({mgr.utilization()['block_util']:.0%} of the *used* blocks are populated)")
 
-    # ---- (e) Bonus: multiple sequences with prefix sharing ----
+    # ----------------------------------------------------------------------
+    # (d) Bonus: prefix sharing.  Project the prompt ONCE, fork three children,
+    #     decode each child with its own random "next token" stream, and check
+    #     that all three children read the same prompt K/V (proving the shared
+    #     blocks are wired up correctly).
+    # ----------------------------------------------------------------------
     print("\n[04] Multi-sequence prefix-sharing sanity check:")
-    pool2 = KVPool(num_blocks=32, n_heads=H, block_size=block_size, head_dim=D,
-                   dtype=dtype, device=device)
+    pool2 = KVPool(num_blocks=32, n_heads=n_heads, block_size=block_size,
+                   head_dim=head_dim, dtype=dtype, device=device)
     mgr2 = BlockManager(pool2)
-    prompt = mgr2.new_sequence()
-    mgr2.append_tokens(prompt, prompt_len)
-    store_kv(pool2, prompt, full_k[:, :prompt_len], full_v[:, :prompt_len], 0)
 
-    children = [mgr2.fork(prompt) for _ in range(3)]
-    # Three independent continuations: pretend each samples a different next K/V.
+    # Prompt: project once, write into the pool, and record the prefix
+    # reference (Lq = Lk = prompt_len => standard lower-triangular mask).
+    prompt_seq = mgr2.new_sequence()
+    q_pf, k_pf, v_pf = attn._project(tokens[:, :prompt_len])
+    mgr2.append_kv(prompt_seq, k_pf.squeeze(0), v_pf.squeeze(0))
+    ref_prefix = paged_attention_single(pool2, prompt_seq, q_pf.squeeze(0), causal=True)
+
+    children = [mgr2.fork(prompt_seq) for _ in range(3)]
     for ci, child in enumerate(children):
-        kc = torch.randn(H, decode_steps, D, device=device, dtype=dtype)
-        vc = torch.randn(H, decode_steps, D, device=device, dtype=dtype)
-        qc = torch.randn(H, decode_steps, D, device=device, dtype=dtype)
-        for step in range(decode_steps):
-            mgr2.append_tokens(child, 1)
-            store_kv(pool2, child, kc[:, step:step+1], vc[:, step:step+1],
-                     token_offset=prompt_len + step)
-        # Run paged attention over the full sequence of this child.
-        full_q_child = torch.cat(
-            [full_q[:, :prompt_len], qc], dim=1
-        )
-        out_child = paged_attention_single(pool2, child, full_q_child, causal=True)
-        # The first `prompt_len` rows of out_child should match the
-        # *single-prompt* reference for the prefix — proves the shared blocks
-        # are read correctly.
-        ref_prefix = scaled_dot_product_attention(
-            full_q[:, :prompt_len].unsqueeze(0),
-            full_k[:, :prompt_len].unsqueeze(0),
-            full_v[:, :prompt_len].unsqueeze(0), causal=True,
-        ).squeeze(0)
-        prefix_err = (ref_prefix - out_child[:, :prompt_len]).abs().max().item()
+        # Each child consumes its own random continuation, decoded one token
+        # at a time — same loop shape as Path B above.
+        x_cont = torch.randn(B, decode_steps, d_model, device=device, dtype=dtype)
+        q_decode: list[torch.Tensor] = []
+        for t in range(decode_steps):
+            x_new = x_cont[:, t:t + 1]
+            q_n, k_n, v_n = attn._project(x_new)
+            mgr2.append_kv(child, k_n.squeeze(0), v_n.squeeze(0))
+            q_decode.append(q_n.squeeze(0))
+
+        # Re-run paged attention over the *full* sequence (prompt + decode):
+        # with Lq == Lk the causal mask is just lower-triangular, so the first
+        # `prompt_len` rows of the output match what a Lq=Lk=prompt_len attention
+        # over the prompt alone would have produced.
+        q_full = torch.cat([q_pf.squeeze(0)] + q_decode, dim=1)  # [H, total, hd]
+        out_child_full = paged_attention_single(pool2, child, q_full, causal=True)
+        prefix_err = (ref_prefix - out_child_full[:, :prompt_len]).abs().max().item()
         print(f"  child {ci}: blocks={child.block_table}, len={child.length}, "
               f"prefix max|err|={prefix_err:.2e}")
         assert prefix_err < 1e-4, "prefix-sharing math is broken"
 
-    print("[04] OK — paged attention agrees with contiguous baseline, "
-          "and prefix sharing reads correct values.")
+    print(
+        "[04] OK — iterative paged decode matches the iterative contiguous "
+        "KV cache (both with real W_q/W_k/W_v), and prefix sharing reads "
+        "identical K/V from the shared blocks."
+    )
 
 
 if __name__ == "__main__":

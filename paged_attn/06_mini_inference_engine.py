@@ -60,7 +60,6 @@ _prefill = _load("paged_attn._07_paged_prefill_triton", _HERE / "07_paged_prefil
 KVPool, BlockManager, Sequence, OutOfBlocks = (
     _bm.KVPool, _bm.BlockManager, _bm.Sequence, _bm.OutOfBlocks,
 )
-store_kv = _naive.store_kv
 paged_attention_decode = _decode.paged_attention_decode
 pack_batch = _decode.pack_batch
 paged_attention_prefill = _prefill.paged_attention_prefill
@@ -221,9 +220,8 @@ class MiniEngine:
         if prompt_seq is None:
             # First request for this prompt: build the cache.
             ps = self.mgr.new_sequence()
-            self.mgr.append_tokens(ps, req.prompt_len)
             k, v = self._make_kv(req.prompt_id, 0, req.prompt_len)
-            store_kv(self.pool, ps, k, v, token_offset=0)
+            self.mgr.append_kv(ps, k, v)
 
             # Run paged *prefill* over the prompt — even though we don't
             # consume the output here, this is the real compute cost a serving
@@ -247,9 +245,8 @@ class MiniEngine:
 
         # Recompute path: rebuild the KV for tokens previously generated.
         if req.generated > 0:
-            self.mgr.append_tokens(req.seq, req.generated)
             k_dec, v_dec = self._make_kv(req.prompt_id, req.prompt_len, req.generated)
-            store_kv(self.pool, req.seq, k_dec, v_dec, token_offset=req.prompt_len)
+            self.mgr.append_kv(req.seq, k_dec, v_dec)
             self.tokens_recomputed += req.generated
 
         self.running.append(req)
@@ -360,9 +357,8 @@ class MiniEngine:
         # 4. Append one fresh K/V per running request and possibly retire.
         retire = []
         for r in self.running:
-            self.mgr.append_tokens(r.seq, 1)
             k, v = self._make_kv(r.prompt_id, r.total_len, 1)
-            store_kv(self.pool, r.seq, k, v, token_offset=r.total_len)
+            self.mgr.append_kv(r.seq, k, v)
             r.generated += 1
             self.tokens_produced += 1
             if r.generated >= r.max_new_tokens:

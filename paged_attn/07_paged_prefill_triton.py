@@ -54,7 +54,6 @@ _HERE = _pl.Path(__file__).resolve().parent
 _bm = _load("paged_attn._03_block_manager", _HERE / "03_block_manager.py")
 _naive = _load("paged_attn._04_paged_attention_naive", _HERE / "04_paged_attention_naive.py")
 KVPool, BlockManager = _bm.KVPool, _bm.BlockManager
-store_kv = _naive.store_kv
 paged_attention_single = _naive.paged_attention_single
 
 
@@ -222,13 +221,12 @@ def run_demo() -> None:
     mgr = BlockManager(pool)
 
     seq = mgr.new_sequence()
-    mgr.append_tokens(seq, prompt_len)
 
     torch.manual_seed(11)
     full_q = torch.randn(H, prompt_len, D, device=device, dtype=dtype)
     full_k = torch.randn(H, prompt_len, D, device=device, dtype=dtype)
     full_v = torch.randn(H, prompt_len, D, device=device, dtype=dtype)
-    store_kv(pool, seq, full_k, full_v, token_offset=0)
+    mgr.append_kv(seq, full_k, full_v)
 
     block_table = torch.tensor(seq.block_table, device=device, dtype=torch.int32)
 
@@ -269,11 +267,10 @@ def run_demo() -> None:
     # the *decode* kernel.  Here we use the prefill kernel itself with Lq=1
     # per step, which is valid and produces identical numerics (just slower).
     for s in range(decode_steps):
-        mgr.append_tokens(seq, 1)
         pos = prompt_len + s
         k_new = torch.randn(H, 1, D, device=device, dtype=dtype)
         v_new = torch.randn(H, 1, D, device=device, dtype=dtype)
-        store_kv(pool, seq, k_new, v_new, token_offset=pos)
+        mgr.append_kv(seq, k_new, v_new)
         # Refresh the block_table tensor (may have grown).
         block_table = torch.tensor(seq.block_table, device=device, dtype=torch.int32)
         q_new = torch.randn(H, 1, D, device=device, dtype=dtype)
@@ -306,11 +303,10 @@ def run_demo() -> None:
                    head_dim=D, dtype=dtype, device=device)
     mgr2 = BlockManager(pool2)
     seq2 = mgr2.new_sequence()
-    mgr2.append_tokens(seq2, L)
     qb = torch.randn(H, L, D, device=device, dtype=dtype)
     kb = torch.randn(H, L, D, device=device, dtype=dtype)
     vb = torch.randn(H, L, D, device=device, dtype=dtype)
-    store_kv(pool2, seq2, kb, vb, token_offset=0)
+    mgr2.append_kv(seq2, kb, vb)
     bt = torch.tensor(seq2.block_table, device=device, dtype=torch.int32)
 
     def triton_prefill():

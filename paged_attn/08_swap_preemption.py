@@ -49,7 +49,6 @@ _naive = _load("paged_attn._04_paged_attention_naive", _HERE / "04_paged_attenti
 KVPool, BlockManager, BlockAllocator, OutOfBlocks, Sequence = (
     _bm.KVPool, _bm.BlockManager, _bm.BlockAllocator, _bm.OutOfBlocks, _bm.Sequence,
 )
-store_kv = _naive.store_kv
 gather_kv = _naive.gather_kv
 
 
@@ -189,10 +188,9 @@ def run_demo() -> None:
     fingerprints: dict[int, tuple] = {}
     for prio, L in enumerate([6, 7]):
         s = mgr.new_sequence()
-        mgr.append_tokens(s, L)
         k = torch.randn(H, L, D, device=device)
         v = torch.randn(H, L, D, device=device)
-        store_kv(gpu_pool, s, k, v, token_offset=0)
+        mgr.append_kv(s, k, v)
         seqs.append(s)
         fingerprints[s.seq_id] = _fingerprint_seq(gpu_pool, s)
     _print_pool(console, mgr, "After admitting seq 0 (len 6) and seq 1 (len 7)")
@@ -202,7 +200,7 @@ def run_demo() -> None:
     console.print("\n[bold yellow]A new high-priority request (len 5) arrives.[/bold yellow]")
     try:
         bad = mgr.new_sequence()
-        mgr.append_tokens(bad, 5)
+        mgr.reserve_slots(bad, 5)
     except OutOfBlocks as e:
         console.print(f"  [red]OutOfBlocks on GPU pool, as expected: {e}[/red]")
         mgr.free_sequence(bad)
@@ -215,10 +213,9 @@ def run_demo() -> None:
 
     # ---- (d) Now there's room. Admit the new request. ----
     new_seq = mgr.new_sequence()
-    mgr.append_tokens(new_seq, 5)
     k_new = torch.randn(H, 5, D, device=device)
     v_new = torch.randn(H, 5, D, device=device)
-    store_kv(gpu_pool, new_seq, k_new, v_new, token_offset=0)
+    mgr.append_kv(new_seq, k_new, v_new)
     fingerprints[new_seq.seq_id] = _fingerprint_seq(gpu_pool, new_seq)
     _print_pool(console, mgr, "After admitting the new request")
 
@@ -248,7 +245,7 @@ def run_demo() -> None:
         mgr.free_sequence(s)
     console.print("\n[bold]Negative test: swapping a shared (refcount>1) sequence is refused.[/bold]")
     parent = mgr.new_sequence()
-    mgr.append_tokens(parent, 4)
+    mgr.reserve_slots(parent, 4)
     child = mgr.fork(parent)
     try:
         mgr.swap_out(parent)

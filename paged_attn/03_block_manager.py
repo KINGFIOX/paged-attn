@@ -21,8 +21,6 @@ Run:
     uv run python paged_attn/03_block_manager.py
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -49,12 +47,18 @@ class KVPool:
     head_dim: int
     dtype: torch.dtype
     device: torch.device
+    # [num_blocks, 2, n_heads, n_heads, block_size, head_dim]
     buffer: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
         self.buffer = torch.zeros(
-            self.num_blocks, 2, self.n_heads, self.block_size, self.head_dim,
-            device=self.device, dtype=self.dtype,
+            self.num_blocks,
+            2,
+            self.n_heads,
+            self.block_size,
+            self.head_dim,
+            device=self.device,
+            dtype=self.dtype,
         )
 
     def k(self, block_id: int) -> torch.Tensor:
@@ -86,6 +90,7 @@ class BlockAllocator:
         # LIFO free list: most-recently-freed blocks are reused first (warm in
         # GPU caches).  Production allocators usually do a FIFO or random order
         # to spread wear; LIFO is fine for learning.
+        # [n-1, n-2, ..., 1, 0]
         self._free = list(range(self.num_blocks - 1, -1, -1))
         self._refcount = [0] * self.num_blocks
 
@@ -101,6 +106,7 @@ class BlockAllocator:
         return block_id
 
     def incref(self, block_id: int) -> None:
+        # 就是在增加引用计数的时候，这个块肯定是有效的
         assert self._refcount[block_id] > 0
         self._refcount[block_id] += 1
 
@@ -123,15 +129,18 @@ class BlockAllocator:
 class Sequence:
     seq_id: int
     block_size: int
-    block_table: list[int] = field(default_factory=list)   # logical -> physical
-    length: int = 0                                        # tokens currently stored
+    block_table: list[int] = field(default_factory=list)  # logical -> physical
+    length: int = 0  # tokens currently stored
 
     def num_logical_blocks(self) -> int:
         return len(self.block_table)
 
     def slots_in_last_block(self) -> int:
-        return self.length - (self.num_logical_blocks() - 1) * self.block_size \
-            if self.block_table else 0
+        return (
+            self.length - (self.num_logical_blocks() - 1) * self.block_size
+            if self.block_table
+            else 0
+        )
 
     def free_slots_in_last_block(self) -> int:
         if not self.block_table:
@@ -147,10 +156,10 @@ class Sequence:
 class BlockManager:
     """The brains that decide which physical blocks back which sequence."""
 
-    def __init__(self, pool: KVPool):
+    def __init__(self, pool: "KVPool"):
         self.pool = pool
         self.alloc = BlockAllocator(pool.num_blocks)
-        self.sequences: dict[int, Sequence] = {}
+        self.sequences: dict[int, Sequence] = {} # <seq_id, squence>
         self._next_seq_id = 0
 
     # ---- lifecycle ----------------------------------------------------------
@@ -158,7 +167,7 @@ class BlockManager:
     def new_sequence(self) -> Sequence:
         seq = Sequence(seq_id=self._next_seq_id, block_size=self.pool.block_size)
         self._next_seq_id += 1
-        self.sequences[seq.seq_id] = seq
+        self.sequences[seq.seq_id] = seq # push
         return seq
 
     def free_sequence(self, seq: Sequence) -> None:
@@ -166,27 +175,41 @@ class BlockManager:
             self.alloc.free(b)
         seq.block_table.clear()
         seq.length = 0
-        del self.sequences[seq.seq_id]
+        del self.sequences[seq.seq_id] # pop
 
     # ---- growth -------------------------------------------------------------
 
-    def append_tokens(self, seq: Sequence, n: int) -> list[int]:
-        """Reserve room for `n` more tokens.  Returns the physical-block-id list
-        for every newly-allocated block (for tests / visualization)."""
+    def reserve_slots(self, seq: Sequence, n: int) -> list[int]:
+        """Make room for `n` more tokens in `seq`'s block table.
+
+        This is *bookkeeping only* — it allocates fresh blocks (and triggers
+        copy-on-write on the shared tail block when necessary), advances
+        `seq.length` to cover the new positions, and returns the physical IDs
+        of the blocks that were newly allocated.  **No K/V data is written.**
+
+        Use `append_kv` if you actually have K/V tensors to store; reach for
+        `reserve_slots` directly only in tests / demos where you just want to
+        exercise the allocator / block-table logic.
+        """
         newly_allocated: list[int] = []
         remaining = n
+
         # First, fill the tail of the last block if there's room.
         if seq.block_table:
             tail_block = seq.block_table[-1]
             # Copy-on-write: if the last block is shared with another sequence,
             # we cannot write into it.  Allocate a fresh copy first.
-            if self.alloc.refcount(tail_block) > 1 and seq.free_slots_in_last_block() > 0:
+            if (
+                self.alloc.refcount(tail_block) > 1
+                and seq.free_slots_in_last_block() > 0
+            ):
                 new_block = self._cow(seq, len(seq.block_table) - 1)
                 newly_allocated.append(new_block)
             free = seq.free_slots_in_last_block()
             take = min(free, remaining)
             seq.length += take
             remaining -= take
+
         # Then allocate whole new blocks as needed.
         while remaining > 0:
             block_id = self.alloc.allocate()
@@ -195,7 +218,40 @@ class BlockManager:
             take = min(self.pool.block_size, remaining)
             seq.length += take
             remaining -= take
+
         return newly_allocated
+
+    def append_kv(self, seq: Sequence, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Append `L` tokens of K/V to `seq`.
+
+        Combines the two halves a real KV-cache update needs:
+
+            1. `reserve_slots(seq, L)` to grow the block table / `seq.length`.
+            2. Scatter-write `k[:, i, :]` and `v[:, i, :]` into the paged pool
+               at the freshly-reserved positions `[start, start + L)`.
+
+        `k` and `v` must have shape `[n_heads, L, head_dim]` and live on the
+        pool's device with the pool's dtype.
+        """
+        assert k.shape == v.shape, f"k.shape={k.shape} v.shape={v.shape}"
+        n_heads, L, head_dim = k.shape
+        assert n_heads == self.pool.n_heads, "head count mismatch"
+        assert head_dim == self.pool.head_dim, "head_dim mismatch"
+        if L == 0:
+            return
+
+        start = seq.length
+        self.reserve_slots(seq, L)
+        bs = self.pool.block_size
+        # Element-wise scatter.  This is the same loop that lived in step 04's
+        # `store_kv`; keeping it here makes `BlockManager` a self-contained
+        # KV-cache layer with no dependency on the attention module.
+        for i in range(L):
+            pos = start + i
+            phys = seq.block_table[pos // bs]
+            slot = pos % bs
+            self.pool.buffer[phys, 0, :, slot, :] = k[:, i, :]
+            self.pool.buffer[phys, 1, :, slot, :] = v[:, i, :]
 
     # ---- copy-on-write fork (prefix sharing) --------------------------------
 
@@ -230,11 +286,11 @@ class BlockManager:
         used_tokens = sum(s.length for s in self.sequences.values())
         block_capacity_tokens = used_blocks * self.pool.block_size
         return {
-            "blocks_used":     used_blocks,
-            "blocks_free":     self.alloc.num_free,
-            "tokens_stored":   used_tokens,
-            "block_capacity":  block_capacity_tokens,
-            "block_util":      used_tokens / max(block_capacity_tokens, 1),
+            "blocks_used": used_blocks,
+            "blocks_free": self.alloc.num_free,
+            "tokens_stored": used_tokens,
+            "block_capacity": block_capacity_tokens,
+            "block_util": used_tokens / max(block_capacity_tokens, 1),
         }
 
 
@@ -263,16 +319,28 @@ def run_demo() -> None:
     console = Console()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pool = KVPool(num_blocks=8, n_heads=2, block_size=4, head_dim=8,
-                  dtype=torch.float16, device=device)
+    pool = KVPool(
+        num_blocks=8,
+        n_heads=2,
+        block_size=4,
+        head_dim=8,
+        dtype=torch.float16,
+        device=device,
+    )
     mgr = BlockManager(pool)
-    console.print(f"[dim]Pool: {pool.num_blocks} blocks * block_size {pool.block_size} "
-                  f"= capacity {pool.num_blocks * pool.block_size} tokens "
-                  f"({pool.bytes() / 1024:.1f} KiB).[/dim]")
+    console.print(
+        f"[dim]Pool: {pool.num_blocks} blocks * block_size {pool.block_size} "
+        f"= capacity {pool.num_blocks * pool.block_size} tokens "
+        f"({pool.bytes() / 1024:.1f} KiB).[/dim]"
+    )
+
+    # Note: this demo only exercises the *bookkeeping* layer, so we call
+    # `reserve_slots` directly.  Real callers (steps 04+) use `append_kv`
+    # which combines the slot reservation with writing K/V into the pool.
 
     # 1) A prompt of 10 tokens => ceil(10/4) = 3 blocks.
     parent = mgr.new_sequence()
-    mgr.append_tokens(parent, 10)
+    mgr.reserve_slots(parent, 10)
     _show(console, mgr, "After prefill (parent: 10 tokens)")
 
     # 2) Fork twice: two beams share the parent's blocks (refcount goes up).
@@ -281,8 +349,8 @@ def run_demo() -> None:
     _show(console, mgr, "After two forks (prefix shared, no copies yet)")
 
     # 3) Each child appends 3 tokens.  The shared last block gets copy-on-write.
-    mgr.append_tokens(child_a, 3)
-    mgr.append_tokens(child_b, 5)
+    mgr.reserve_slots(child_a, 3)
+    mgr.reserve_slots(child_b, 5)
     _show(console, mgr, "After child_a += 3 tokens, child_b += 5 tokens (COW kicks in)")
 
     # 4) Drop child_a and the parent; only child_b's blocks should remain.
@@ -293,7 +361,7 @@ def run_demo() -> None:
     # 5) Try to run out of memory on purpose, just to see the allocator complain.
     try:
         big = mgr.new_sequence()
-        mgr.append_tokens(big, 99)  # way more than capacity
+        mgr.reserve_slots(big, 99)  # way more than capacity
     except OutOfBlocks as e:
         console.print(f"\n[red]OutOfBlocks (expected): {e}[/red]")
 

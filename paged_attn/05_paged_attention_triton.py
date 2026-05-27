@@ -55,7 +55,6 @@ _HERE = _pl.Path(__file__).resolve().parent
 _bm = _load("paged_attn._03_block_manager", _HERE / "03_block_manager.py")
 _naive = _load("paged_attn._04_paged_attention_naive", _HERE / "04_paged_attention_naive.py")
 KVPool, BlockManager = _bm.KVPool, _bm.BlockManager
-store_kv = _naive.store_kv
 paged_attention_single = _naive.paged_attention_single
 
 
@@ -244,10 +243,9 @@ def run_demo() -> None:
     full_ks, full_vs, full_qs = [], [], []  # one query per sequence (decode step)
     for L in seq_lens:
         seq = mgr.new_sequence()
-        mgr.append_tokens(seq, L)
         k = torch.randn(H, L, D, device=device, dtype=dtype)
         v = torch.randn(H, L, D, device=device, dtype=dtype)
-        store_kv(pool, seq, k, v, token_offset=0)
+        mgr.append_kv(seq, k, v)
         sequences.append(seq)
         full_ks.append(k); full_vs.append(v)
         full_qs.append(torch.randn(H, 1, D, device=device, dtype=dtype))

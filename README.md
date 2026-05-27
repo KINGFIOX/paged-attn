@@ -80,15 +80,20 @@ uv run python paged_attn/08_swap_preemption.py
 - `BlockAllocator`：带 refcount 的 free list（LIFO，让 GPU 缓存友好）。
 - `Sequence`：一个请求对应一个"虚拟地址空间"——`block_table` 把逻辑块号
   映射到物理块号。
-- `BlockManager`：`new_sequence` / `append_tokens` / `fork` / `free_sequence`。
+- `BlockManager`：`new_sequence` / `reserve_slots` / `append_kv` / `fork` /
+  `free_sequence`。`reserve_slots(seq, n)` 只做"在 block table 里腾位置"，
+  不碰 K/V 数据；真正写数据走 `append_kv(seq, k, v)`，它内部先 `reserve_slots`
+  再把 K/V 按 `(pos // block_size, pos % block_size)` 落位到 pool 里。
 - **重点：copy-on-write**。`fork(parent)` 让 child 直接共享 parent 的 block，
   refcount 加一；只有当其中一方真的要往一个共享 block 里写时，才克隆这一个
   block，更新指针。这就是 beam search / n-best 不再爆显存的根因。
 
 ### 04. Paged attention 前向（pure PyTorch）
 
-- 把 K/V 写进 paged pool：`store_kv(pool, seq, k, v, offset)`，每个 token 通过
-  `(logical_block, slot) = (pos // block_size, pos % block_size)` 落位。
+- 高层调用直接 `mgr.append_kv(seq, k, v)`：一次完成"腾位置 + 写 K/V"。
+- step 04 额外保留了底层工具 `store_kv(pool, seq, k, v, offset)` —— 它写
+  *已经预留好*的任意 offset，主要给 swap-in 回填、chunked-prefill 这类
+  非追加场景用。
 - 把 paged K/V 重新 gather 回 `[H, L, D]` 然后调 step 01 的 attention，作为
   paged 路径的参考实现。
 - 与 step 01 的连续 KV cache 做端到端对照：误差 2e-7。
