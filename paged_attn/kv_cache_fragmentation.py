@@ -10,7 +10,7 @@ Llama-like config, simulate a realistic mix of in-flight requests, and print
 how badly the classic layout fragments memory.
 
 Run:
-    uv run python paged_attn/02_kv_cache_fragmentation.py
+    uv run python -m paged_attn.kv_cache_fragmentation
 """
 
 from dataclasses import dataclass

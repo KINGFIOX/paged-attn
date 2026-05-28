@@ -18,7 +18,7 @@ This file builds *only* the bookkeeping layer (no attention math yet):
                             and free.
 
 Run:
-    uv run python paged_attn/03_block_manager.py
+    uv run python -m paged_attn.block_manager
 """
 
 from dataclasses import dataclass, field

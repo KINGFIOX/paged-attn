@@ -11,8 +11,8 @@ and adds the scheduler that turns these primitives into a serving engine:
     * Prefix sharing      — same prompt_id forks from a shared prompt cache.
     * Admission control   — reserve worst-case future blocks per request.
     * Recompute preemption — if a pending request is stuck and the pool is
-      full, evict the most-recently-admitted running request (LIFO).  Its
-      KV is dropped; on re-admission we rebuild it.  (vLLM's default
+      full, evict the most-recently-admitted running request (LIFO, last in first out).
+      Its KV is dropped; on re-admission we rebuild it.  (vLLM's default
       strategy; the alternative — CPU swap — lives in step 08.)
 
 This is still a *toy* model: there is no transformer, only an attention
@@ -22,14 +22,11 @@ PyTorch path from step 04 — slow but easy to reason about; swap in a
 fused kernel later without touching the scheduler.
 
 Run:
-    uv run python paged_attn/06_mini_inference_engine.py
+    uv run python -m paged_attn.mini_inference_engine
 """
 
 from __future__ import annotations
 
-import importlib.util as _ilu
-import pathlib as _pl
-import sys as _sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -38,22 +35,8 @@ import torch
 from rich.console import Console
 from rich.table import Table
 
-
-def _load(name: str, path: _pl.Path):
-    spec = _ilu.spec_from_file_location(name, path)
-    mod = _ilu.module_from_spec(spec)
-    _sys.modules[name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod
-
-
-_HERE = _pl.Path(__file__).resolve().parent
-_bm = _load("paged_attn._03_block_manager", _HERE / "03_block_manager.py")
-_naive = _load("paged_attn._04_paged_attention_naive", _HERE / "04_paged_attention_naive.py")
-KVPool, BlockManager, Sequence, OutOfBlocks = (
-    _bm.KVPool, _bm.BlockManager, _bm.Sequence, _bm.OutOfBlocks,
-)
-paged_attention_single = _naive.paged_attention_single
+from .block_manager import BlockManager, KVPool, Sequence
+from .paged_attention_naive import paged_attention_single
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +412,8 @@ def run_demo() -> None:
     contig_capacity = (num_blocks * block_size * bytes_per_token) // contig_bytes_per_req
 
     table = Table(title=f"MiniEngine: 24 long + 8 high-pri requests, pool={num_blocks} blocks")
-    table.add_column("metric"); table.add_column("with preemption", justify="right")
+    table.add_column("metric")
+    table.add_column("with preemption", justify="right")
     table.add_column("no preemption", justify="right")
     table.add_row("steps run", f"{engine_p.step_count}", f"{engine_n.step_count}")
     table.add_row("tokens produced", f"{engine_p.tokens_produced}", f"{engine_n.tokens_produced}")

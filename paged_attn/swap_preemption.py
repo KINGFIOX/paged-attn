@@ -22,34 +22,22 @@ Constraints we adopt for clarity:
       preserved as-is — only the "device" of each entry changes.
 
 Run:
-    uv run python paged_attn/08_swap_preemption.py
+    uv run python -m paged_attn.swap_preemption
 """
 
 from __future__ import annotations
 
-import importlib.util as _ilu
-import pathlib as _pl
-import sys as _sys
-
 import torch
 from rich.console import Console
 
-
-def _load(name: str, path: _pl.Path):
-    spec = _ilu.spec_from_file_location(name, path)
-    mod = _ilu.module_from_spec(spec)
-    _sys.modules[name] = mod
-    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-    return mod
-
-
-_HERE = _pl.Path(__file__).resolve().parent
-_bm = _load("paged_attn._03_block_manager", _HERE / "03_block_manager.py")
-_naive = _load("paged_attn._04_paged_attention_naive", _HERE / "04_paged_attention_naive.py")
-KVPool, BlockManager, BlockAllocator, OutOfBlocks, Sequence = (
-    _bm.KVPool, _bm.BlockManager, _bm.BlockAllocator, _bm.OutOfBlocks, _bm.Sequence,
+from .block_manager import (
+    BlockAllocator,
+    BlockManager,
+    KVPool,
+    OutOfBlocks,
+    Sequence,
 )
-gather_kv = _naive.gather_kv
+from .paged_attention_naive import gather_kv
 
 
 # ---------------------------------------------------------------------------

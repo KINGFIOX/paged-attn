@@ -23,7 +23,7 @@ product.  The cache then saves both:
     * **Attention FLOPs**:   (L+t)²·d  →    (L+t)·d     per decode step.
 
 Run:
-    uv run python paged_attn/01_standard_attention.py
+    uv run python -m paged_attn.standard_attention
 """
 
 import math
