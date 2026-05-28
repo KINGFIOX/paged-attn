@@ -101,23 +101,6 @@ def gather_kv(pool: KVPool, seq: Sequence) -> tuple[torch.Tensor, torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 
-def paged_attention_single(
-    pool: KVPool,
-    seq: Sequence,
-    q: torch.Tensor,  # [H, Lq, D]
-    causal: bool = True,
-) -> torch.Tensor:  # [H, Lq, D]
-    k, v = gather_kv(pool, seq)  # [H, L, D]
-    # Lift to [B=1, H, *, D] and reuse the standard kernel.
-    out = scaled_dot_product_attention(
-        q.unsqueeze(0),
-        k.unsqueeze(0),
-        v.unsqueeze(0),
-        causal=causal,
-    )
-    return out.squeeze(0)
-
-
 # ---------------------------------------------------------------------------
 # A "paged" drop-in for step 01's ContiguousKVCache.
 # ---------------------------------------------------------------------------
@@ -157,30 +140,52 @@ class PagedKVCache:
         )
         self.mgr.append_kv(self.seq, k_new.squeeze(0), v_new.squeeze(0))
 
-    def attend(self, q_new: torch.Tensor, causal: bool = True) -> torch.Tensor:
-        out = paged_attention_single(
-            self.pool, self.seq, q_new.squeeze(0), causal=causal
+
+def paged_attention_single(
+    cache: PagedKVCache, q_new: torch.Tensor, causal: bool = True
+) -> torch.Tensor:
+    def _paged_attention_single(
+        pool: KVPool,
+        seq: Sequence,
+        q: torch.Tensor,  # [H, Lq, D]
+        causal: bool = True,
+    ) -> torch.Tensor:  # [H, Lq, D]
+        k, v = gather_kv(pool, seq)  # [H, L, D]
+        # Lift to [B=1, H, *, D] and reuse the standard kernel.
+        out = scaled_dot_product_attention(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            causal=causal,
         )
-        return out.unsqueeze(0)  # back to [B=1, H, L_new, head_dim]
+        return out.squeeze(0)
+
+    out = _paged_attention_single(
+        cache.pool, cache.seq, q_new.squeeze(0), causal=causal
+    )
+    return out.unsqueeze(0)  # back to [B=1, H, L_new, head_dim]
 
 
-def forward_with_paged_cache(
-    attn: "MiniSelfAttention",
-    x_new: torch.Tensor,  # [B=1, L_new, d_model]
-    paged_cache: PagedKVCache,
-) -> torch.Tensor:  # [B=1, H, L_new, head_dim]
-    """Paged twin of `MiniSelfAttention.forward_with_cache`.
+class PagedSelfAttention(MiniSelfAttention):
+    """ """
 
-    Project `x_new` to Q/K/V via the *same* `W_q/W_k/W_v` as the contiguous
-    path, append the freshly-projected K/V into the paged cache, then attend
-    over the full (cached + new) K/V history.
+    def forward_with_paged_cache(
+        self,
+        x_new: torch.Tensor,  # [B=1, L_new, d_model]
+        paged_cache: PagedKVCache,
+    ) -> torch.Tensor:  # [B=1, H, L_new, head_dim]
+        """Paged twin of `MiniSelfAttention.forward_with_cache`.
 
-    Step 01:   `attn.forward_with_cache(x_new, contig_cache)`
-    Step 04:   `forward_with_paged_cache(attn, x_new, paged_cache)`
-    """
-    q_new, k_new, v_new = attn._project(x_new)
-    paged_cache.append(k_new, v_new)
-    return paged_cache.attend(q_new)
+        Project `x_new` to Q/K/V via the *same* `W_q/W_k/W_v` as the contiguous
+        path, append the freshly-projected K/V into the paged cache, then attend
+        over the full (cached + new) K/V history.
+
+        Step 01:   `attn.forward_with_cache(x_new, contig_cache)`
+        Step 04:   `forward_with_paged_cache(attn, x_new, paged_cache)`
+        """
+        q_new, k_new, v_new = self._project(x_new)
+        paged_cache.append(k_new, v_new)
+        return paged_attention_single(paged_cache, q_new) # [B=1, H, L_new, head_dim]
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +215,7 @@ def run_demo() -> None:
     total_len = prompt_len + decode_steps
 
     # Same attention layer as step 01.  W_q/W_k/W_v live here.
-    attn = MiniSelfAttention(d_model, n_heads).to(device=device, dtype=dtype)
+    attn = PagedSelfAttention(d_model, n_heads).to(device=device, dtype=dtype)
     # Fake "input tokens": in a real transformer these come from the embedding
     # layer (or the previous block's output).  We materialise the whole stream
     # up front so that both paths consume the exact same inputs at each step.
@@ -252,11 +257,11 @@ def run_demo() -> None:
     paged_cache = PagedKVCache(pool, mgr, mgr.new_sequence())
     outs_b: list[torch.Tensor] = []  # a list of [B=1, H, L_new, head_dim]
 
-    out_p = forward_with_paged_cache(attn, tokens[:, :prompt_len], paged_cache)
+    out_p = attn.forward_with_paged_cache(tokens[:, :prompt_len], paged_cache)
     outs_b.append(out_p)
     for t in range(decode_steps):
         x_new = tokens[:, prompt_len + t : prompt_len + t + 1]
-        out_p = forward_with_paged_cache(attn, x_new, paged_cache)
+        out_p = attn.forward_with_paged_cache(x_new, paged_cache)
         outs_b.append(out_p)
     out_paged = torch.cat(outs_b, dim=2).squeeze(0)  # [H,total,hd]
 
@@ -280,10 +285,17 @@ def run_demo() -> None:
     )
 
     # ----------------------------------------------------------------------
-    # (d) Bonus: prefix sharing.  Project the prompt ONCE, fork three children,
-    #     decode each child with its own random "next token" stream, and check
-    #     that all three children read the same prompt K/V (proving the shared
-    #     blocks are wired up correctly).
+    # (d) Bonus: prefix sharing / copy-on-write sanity check.
+    #
+    #     First run the prompt once and keep that output as the "clean prefix"
+    #     reference.  Then fork several children from the prompt cache and let
+    #     each child perform its own token-by-token decode.  Those decode steps
+    #     mutate each child's cache state and may trigger COW, but they must not
+    #     change the already-shared prompt prefix.
+    #
+    #     After the decode steps, we are free to run an extra verification
+    #     attention computation over the child.  The only thing we check is that
+    #     the prefix positions still match the original one-shot prompt forward.
     # ----------------------------------------------------------------------
     print("\n[04] Multi-sequence prefix-sharing sanity check:")
     pool2 = KVPool(
@@ -296,11 +308,10 @@ def run_demo() -> None:
     )
     mgr2 = BlockManager(pool2)
 
-    # Prompt: project once via `forward_with_paged_cache` so the prefix output
-    # (Lq = Lk = prompt_len => standard lower-triangular mask) is recorded as
-    # the reference that every child must reproduce on its prefix positions.
+    # One-shot prompt forward: this is the prefix result before any child has
+    # performed additional decode work.
     prompt_cache = PagedKVCache(pool2, mgr2, mgr2.new_sequence())
-    ref_prefix = forward_with_paged_cache( attn, tokens[:, :prompt_len], prompt_cache).squeeze(0)  # [H, prompt_len, hd]
+    ref_prefix = attn.forward_with_paged_cache(tokens[:, :prompt_len], prompt_cache).squeeze(0)  # [H, prompt_len, hd]
 
     children = [mgr2.fork(prompt_cache.seq) for _ in range(3)]
     for ci, child in enumerate(children):
@@ -309,24 +320,24 @@ def run_demo() -> None:
         # shared via fork).
         child_cache = PagedKVCache(pool2, mgr2, child)
 
-        # Each child consumes its own random continuation, one token at a time,
-        # via the SAME 1-line API as Path B.
+        # Simulate real decode: each child consumes its own continuation one
+        # token at a time.  We ignore the outputs here; the important side
+        # effect is appending K/V to the child's cache and exercising COW.
         x_cont = torch.randn(B, decode_steps, d_model, device=device, dtype=dtype)
-        decode_outs: list[torch.Tensor] = []
         for t in range(decode_steps):
-            out_p = forward_with_paged_cache(attn, x_cont[:, t : t + 1], child_cache)
-            decode_outs.append(out_p)
+            _ = attn.forward_with_paged_cache(x_cont[:, t : t + 1], child_cache)
 
-        # To verify the prefix part, project the prompt's Q again and run
-        # paged attention with `q_full = [q_prompt, q_decode]` against the
-        # child's full K/V.  With Lq == Lk the causal mask is just lower-
-        # triangular, so the first `prompt_len` output rows correspond to the
-        # prompt positions and must equal `ref_prefix`.
+        # Verification computation after decode.  We rebuild Q for the full
+        # child sequence and run attention against the child's current K/V.
+        # This extra computation is not the point of the demo; it simply gives
+        # us prefix-position outputs to compare against `ref_prefix`.  Because
+        # Lq == Lk here, the causal mask is the usual lower-triangular mask, so
+        # the first `prompt_len` rows correspond to the original prompt.
         # Lp: length of prompt
         q_prompt = attn._project(tokens[:, :prompt_len])[0]  # [B,H,Lp,hd]
         q_decode = attn._project(x_cont)[0]  # [B,H,decode,hd]
         q_full = torch.cat([q_prompt, q_decode], dim=2)  # [B,H,total,hd]
-        out_child_full = child_cache.attend(q_full).squeeze(0)  # [H,total,hd]
+        out_child_full = paged_attention_single(child_cache, q_full).squeeze( 0)  # [H,total,hd]
         prefix_err = (ref_prefix - out_child_full[:, :prompt_len]).abs().max().item()
         print(
             f"  child {ci}: blocks={child.block_table}, len={child.length}, "
