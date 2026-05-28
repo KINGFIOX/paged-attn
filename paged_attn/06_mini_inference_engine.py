@@ -3,8 +3,7 @@
 Pulls together everything from the earlier steps:
 
     * block-paged KV pool + refcounting allocator      (step 03)
-    * Triton paged *prefill* kernel (Lq > 1)           (step 07)
-    * Triton paged *decode*  kernel (Lq = 1)           (step 05)
+    * naive PyTorch paged attention forward            (step 04)
 
 and adds the scheduler that turns these primitives into a serving engine:
 
@@ -18,7 +17,9 @@ and adds the scheduler that turns these primitives into a serving engine:
 
 This is still a *toy* model: there is no transformer, only an attention
 layer.  But the scheduling story is exactly the same as in vLLM /
-TensorRT-LLM / SGLang.
+TensorRT-LLM / SGLang.  Attention itself runs through the naive paged
+PyTorch path from step 04 — slow but easy to reason about; swap in a
+fused kernel later without touching the scheduler.
 
 Run:
     uv run python paged_attn/06_mini_inference_engine.py
@@ -27,17 +28,11 @@ Run:
 from __future__ import annotations
 
 import importlib.util as _ilu
-import os as _os
 import pathlib as _pl
 import sys as _sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
-
-for _stub in ("/usr/local/cuda/lib64/stubs", "/usr/local/cuda-12.6/lib64/stubs"):
-    if _pl.Path(_stub, "libcuda.so").exists():
-        _os.environ["LIBRARY_PATH"] = f"{_stub}:{_os.environ.get('LIBRARY_PATH', '')}"
-        break
 
 import torch
 from rich.console import Console
@@ -55,14 +50,10 @@ def _load(name: str, path: _pl.Path):
 _HERE = _pl.Path(__file__).resolve().parent
 _bm = _load("paged_attn._03_block_manager", _HERE / "03_block_manager.py")
 _naive = _load("paged_attn._04_paged_attention_naive", _HERE / "04_paged_attention_naive.py")
-_decode = _load("paged_attn._05_paged_attention_triton", _HERE / "05_paged_attention_triton.py")
-_prefill = _load("paged_attn._07_paged_prefill_triton", _HERE / "07_paged_prefill_triton.py")
 KVPool, BlockManager, Sequence, OutOfBlocks = (
     _bm.KVPool, _bm.BlockManager, _bm.Sequence, _bm.OutOfBlocks,
 )
-paged_attention_decode = _decode.paged_attention_decode
-pack_batch = _decode.pack_batch
-paged_attention_prefill = _prefill.paged_attention_prefill
+paged_attention_single = _naive.paged_attention_single
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +97,6 @@ class MiniEngine:
 
     def __init__(self, *, num_blocks: int, block_size: int, n_heads: int, head_dim: int,
                  device: torch.device, dtype=torch.float16,
-                 max_blocks_per_seq: int = 256,
                  enable_preemption: bool = True):
         self.pool = KVPool(num_blocks=num_blocks, n_heads=n_heads,
                            block_size=block_size, head_dim=head_dim,
@@ -115,7 +105,6 @@ class MiniEngine:
         self.device = device
         self.dtype = dtype
         self.n_heads, self.head_dim = n_heads, head_dim
-        self.max_blocks_per_seq = max_blocks_per_seq
         self.enable_preemption = enable_preemption
 
         # Cached prompt "sequences": one per unique prompt_id.
@@ -223,15 +212,11 @@ class MiniEngine:
             k, v = self._make_kv(req.prompt_id, 0, req.prompt_len)
             self.mgr.append_kv(ps, k, v)
 
-            # Run paged *prefill* over the prompt — even though we don't
+            # Run paged attention over the prompt — even though we don't
             # consume the output here, this is the real compute cost a serving
             # engine pays on first appearance of a prompt.
-            bt = torch.tensor(ps.block_table, device=self.device, dtype=torch.int32)
             q_prompt = self._make_q_prompt(req.prompt_id, req.prompt_len)
-            _ = paged_attention_prefill(
-                q_prompt, self.pool.buffer, bt,
-                context_len=req.prompt_len, query_start=0,
-            )
+            _ = paged_attention_single(self.pool, ps, q_prompt, causal=True)
 
             self._prompt_seqs[req.prompt_id] = ps
             self._prompt_refs[req.prompt_id] = 0
@@ -337,22 +322,13 @@ class MiniEngine:
 
         self.peak_concurrent = max(self.peak_concurrent, len(self.running))
 
-        # 2. Build the [B, H, D] decode-query batch.
-        qs = [self._make_q_decode(r).squeeze(1) for r in self.running]  # each [H, D]
-        q_batch = torch.stack(qs, dim=0)
-        block_tables, ctx_lens = pack_batch(
-            [r.seq for r in self.running], device=self.device, dtype=torch.int32,
-        )
-        if block_tables.shape[1] < self.max_blocks_per_seq:
-            pad = torch.zeros(
-                block_tables.shape[0],
-                self.max_blocks_per_seq - block_tables.shape[1],
-                device=self.device, dtype=block_tables.dtype,
-            )
-            block_tables = torch.cat([block_tables, pad], dim=1)
-
-        # 3. Paged decode attention.
-        _ = paged_attention_decode(q_batch, self.pool.buffer, block_tables, ctx_lens)
+        # 2. Per-request decode attention via the naive paged path.  A real
+        # serving engine fuses these into a batched kernel (see step 05 in the
+        # old commit history) — we drop the outputs anyway since this engine
+        # only tracks block-management / scheduling behavior.
+        for r in self.running:
+            q_r = self._make_q_decode(r)  # [H, 1, D]
+            _ = paged_attention_single(self.pool, r.seq, q_r, causal=True)
 
         # 4. Append one fresh K/V per running request and possibly retire.
         retire = []
@@ -407,7 +383,6 @@ def _run_engine(num_blocks: int, *, enable_preemption: bool,
     engine = MiniEngine(
         num_blocks=num_blocks, block_size=16, n_heads=8, head_dim=64,
         device=device, dtype=torch.float16,
-        max_blocks_per_seq=(96 + 96) // 16 + 1,
         enable_preemption=enable_preemption,
     )
     # Wave 1 arrives at step 0 — fills the pool with long, low-priority work.

@@ -5,9 +5,12 @@
 
 PagedAttention（vLLM 的核心机制）解决的是 LLM 推理时 KV cache 的内存碎片化问题。
 我们一步步把它拆开：先讲清楚 KV cache 为什么浪费，再实现"操作系统式"的分页
-管理器、写 paged attention 前向、用 Triton 写 prefill / decode 两个内核，
-最后塞进一个最小推理引擎里看连续批处理 + 前缀共享 + 抢占；并独立演示 CPU swap
-作为另一种抢占策略。
+管理器、写一份 pure-PyTorch 的 paged attention 前向，最后塞进一个最小推理引擎里
+看连续批处理 + 前缀共享 + 抢占；并独立演示 CPU swap 作为另一种抢占策略。
+
+> 当前版本只走 naive PyTorch paged attention，没有 Triton/CUDA 内核。后续要加
+> 速时把 step 06 引擎里的 `paged_attention_single` 替换成融合内核即可，调度
+> 逻辑无需改动。
 
 ## 仓库结构
 
@@ -17,9 +20,7 @@ paged_attn/
   02_kv_cache_fragmentation.py  # 量化连续布局浪费多少 GiB，分页能省多少
   03_block_manager.py           # KV pool、block table、free list、refcount + COW
   04_paged_attention_naive.py   # 纯 PyTorch 版 paged attention（与 01 校验等价）
-  05_paged_attention_triton.py  # Triton 内核版 paged DECODE，约 20× 加速
   06_mini_inference_engine.py   # 最小推理引擎：prefill+decode+前缀共享+重算抢占
-  07_paged_prefill_triton.py    # Triton 内核版 paged PREFILL（Lq>1, 支持 chunked）
   08_swap_preemption.py         # CPU swap 池 + swap_out/swap_in，作为抢占的另一种方案
 ```
 
@@ -31,24 +32,20 @@ GPU 机器（已在 NVIDIA A800 80GB / CUDA 12.7 driver 上验证）：
 uv sync
 ```
 
-会装好 `torch 2.5.1+cu124`、`triton 3.1.0`、`transformers`、`rich` 等。
+会装好 `torch 2.5.1+cu124`、`transformers`、`rich` 等。
 
 ## 推荐学习顺序
 
-按文件名前缀 01→08 顺序跑。各步运行命令：
+按文件名前缀顺序跑。各步运行命令：
 
 ```bash
 uv run python paged_attn/01_standard_attention.py
 uv run python paged_attn/02_kv_cache_fragmentation.py
 uv run python paged_attn/03_block_manager.py
 uv run python paged_attn/04_paged_attention_naive.py
-uv run python paged_attn/05_paged_attention_triton.py
-uv run python paged_attn/07_paged_prefill_triton.py
 uv run python paged_attn/06_mini_inference_engine.py
 uv run python paged_attn/08_swap_preemption.py
 ```
-
-（07 在 06 之前跑因为 06 依赖 07 的 prefill 内核。）
 
 各步的学习要点：
 
@@ -101,40 +98,17 @@ uv run python paged_attn/08_swap_preemption.py
   输出在三个 child 上完全一致（误差仍 2e-7），证明共享 block 真的被三个序列同时
   正确读出。
 
-### 05. Triton 内核版 paged attention（DECODE）
-
-- 每个 Triton program 处理一个 `(sequence, head)`，loop 走 block table 上每一个
-  物理块。
-- 内核里就是 **Flash-Attention 风格的在线 softmax**：跟踪 running max `m` 和
-  归一化 `l`，每读一个 block 增量更新 `acc`。
-- 数值上和 step 04 一致（fp16 容差，rel\~6e-4）。
-- 在 batch=8 / 8 heads / head_dim=64、序列 12–1000 这组样例上：
-  - PyTorch reference per step: \~2100 µs
-  - Triton paged decode per step: \~103 µs（**\~20× 加速**）
-
-### 07. Triton 内核版 paged attention（PREFILL）
-
-- decode 内核只能 `Lq == 1`。这里我们写 `Lq > 1` 的版本：一个 program 处理
-  `(head, query_tile_of_BLOCK_M_rows)`，二维分块 + Flash-Attention 2 风格的
-  在线 softmax。
-- causal 用绝对位置实现（`k_abs <= q_abs`），这让它**自动支持 chunked prefill**：
-  长 prompt 切成 64-token chunk，每个 chunk 传不同的 `query_start`，结果与一次
-  跑完 bit-exact。
-- 同样验证三种使用场景：fresh prefill、chunked prefill、`Lq=1 + query_start>0`
-  形式的 decode。误差均 \~2e-3（fp16 容差）。
-- Lq=2048 上 1.6× 超过 PyTorch 参考，但更重要的是它**直接吃 paged K/V**——
-  这是 vLLM/SGLang 在生产里跑长 prompt 时唯一可行的路径。
-
 ### 06. 最小推理引擎（prefill + decode + 抢占）
 
 把前面所有组件拼成一个能跑的玩具：
 
-- 调度循环：每步从 `pending` 队列里准入能放下的请求，
-  再把当前 `running` 里所有请求合成一个 `[B, H, D]` 的 query batch，
-  调一次 Triton paged decode 内核，append 一个 token，
-  完成数 == `max_new_tokens` 就退场。
-- **每个新 prompt 第一次出现时**走 step 07 的 prefill 内核计算 prompt 注意力
-  （结果丢弃，但这是真实引擎要付的算力）。
+- 调度循环：每步从 `pending` 队列里准入能放下的请求，再为每个 running 请求
+  调一次 `paged_attention_single`（step 04 的 naive PyTorch 实现）模拟
+  decode attention 的算力开销，append 一个 token，完成数 == `max_new_tokens`
+  就退场。注意力输出在这个 toy 引擎里被丢弃——本步关心的是调度、内存、抢占行为，
+  不是算 logits。
+- **每个新 prompt 第一次出现时**也走一次 `paged_attention_single` 算 prompt
+  attention（同样丢弃输出，但这是真实引擎要付的算力）。
 - 准入控制：分两本账——**每个请求**只预留自己的 decode 块，**每个 prompt cache**
   独立预留自己的 prompt 块（这样 fresh request 退场后 prompt cache 依旧有人记账，
   避免"孤儿块"导致后续 OOM）。
@@ -169,22 +143,24 @@ uv run python paged_attn/08_swap_preemption.py
 | 01 with-cache vs no-cache (含 Wq/Wk/Wv) | fp32 | no-cache streaming | 1.2e-7 |
 | 04 paged vs contiguous | fp32 | step 01 | 2.4e-7 |
 | 04 prefix-shared child prefix | fp32 | step 01 | 2.4e-7 |
-| 05 Triton decode vs PyTorch reference | fp16 | step 04 | 9.8e-4 |
-| 07 Triton prefill, full | fp16 | step 04 | 2.0e-3 |
-| 07 Triton prefill, chunked | fp16 | step 04 | 2.0e-3 |
 | 08 swap_out + swap_in round-trip | fp32 | 原始数据 | **0** |
 | 06 抢占前 vs 抢占后 token 计数 | — | 自身 | 一致 |
 
 ## 还没写、读完后可以自己加的
 
-- **GQA**：05 / 07 的内核假设 `n_kv_heads == n_q_heads`。改成 GQA 只需把 `pid_h`
-  分成 `q_head_id` 和 `kv_head_id = q_head_id // (n_q_heads/n_kv_heads)`。
-- **多请求 prefill batching**：07 一次跑一个序列。生产 vLLM 用 varlen 接口
-  `(packed_q, cu_seqlens_q, cu_seqlens_k)` 把一个批次的 prefill 一并发射。
+- **Triton/CUDA 内核版 paged decode + prefill**：把 `paged_attention_single`
+  替换成在线 softmax 风格的 fused 内核（Flash-Attention 风格，跟踪 running
+  `m, l, acc`），引擎其余部分可以原样保留。decode 一个 program 处理
+  `(sequence, head)`、prefill 二维分块 `(head, query_tile)`。
+- **多请求 prefill batching**：当前引擎逐请求调一次 attention。生产 vLLM 用
+  varlen 接口 `(packed_q, cu_seqlens_q, cu_seqlens_k)` 把一个批次的 prefill
+  一并发射。
 - **swap 抢占接入引擎**：把 step 08 的 `SwappableBlockManager` 替换 step 06
   的 `BlockManager`，在 `_preempt` 中优先尝试 swap，失败再走 recompute。
+- **GQA**：当前 K/V 头数等于 Q 头数。改成 GQA 时 attention 端把 `q_head_id` 和
+  `kv_head_id = q_head_id // (n_q_heads / n_kv_heads)` 解耦即可。
 - **量化 KV cache**：把 K/V 从 fp16 压成 int8 / fp8，pool buffer 改成 uint8，
-  Triton 内核里在读出后做 dequant。
+  attention 里读出后做 dequant。
 
 ## 参考
 
