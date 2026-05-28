@@ -143,7 +143,7 @@ class ContiguousKVCache:
         """Append `L_new` tokens (same for every batch row) to the cache."""
         assert k_new.shape == v_new.shape
         B, H, L_new, D = k_new.shape
-        # For clarity this toy assumes the batch is aligned; step 06 lifts that.
+        # For clarity this toy assumes every batch row has the same cache length.
         offset = int(self.lengths[0].item())
         assert torch.all(self.lengths == offset), "this toy cache assumes aligned lengths"
         self.k[:, :, offset:offset + L_new] = k_new

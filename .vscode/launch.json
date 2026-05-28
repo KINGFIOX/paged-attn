@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug paged attention naive",
+      "type": "python",
+      "request": "launch",
+      "module": "paged_attn.paged_attention_naive",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "python": "${workspaceFolder}/.venv/bin/python"
+    }
+  ]
+}
